@@ -1,254 +1,200 @@
 """
-סורק עבודות צילום ועריכה מפייסבוק - Streamlit App
-מחפש מודעות בקבוצות פייסבוק ומכין טבלה עם הצעות תגובה
+סורק עבודות צילום ועריכה – Apify + Streamlit
 """
 
 import streamlit as st
 import pandas as pd
-import time
-import random
+import requests
 import json
 import re
+import time
+import os
 from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from pathlib import Path
 
 # ─────────────────────────────────────────────
-# הגדרות קבועות
+# .env helpers
+# ─────────────────────────────────────────────
+ENV_FILE = Path(".env")
+
+def load_env_key() -> str:
+    """טען Apify token מקובץ .env אם קיים"""
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            if line.startswith("APIFY_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+def save_env_key(token: str):
+    """שמור Apify token לקובץ .env"""
+    lines = []
+    if ENV_FILE.exists():
+        lines = [l for l in ENV_FILE.read_text(encoding="utf-8").splitlines()
+                 if not l.startswith("APIFY_TOKEN=")]
+    lines.append(f"APIFY_TOKEN={token}")
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+def delete_env_key():
+    """מחק את הטוקן מהקובץ"""
+    if ENV_FILE.exists():
+        lines = [l for l in ENV_FILE.read_text(encoding="utf-8").splitlines()
+                 if not l.startswith("APIFY_TOKEN=")]
+        ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+# ─────────────────────────────────────────────
+# קבועים
 # ─────────────────────────────────────────────
 MY_INFO = {
     "name": "אומר",
-    "email": "omer7411@gmail.com",
     "phone": "058-743-2288",
     "website": "omerphotos.com",
+    "email": "omer7411@gmail.com",
 }
 
-# מילות מפתח לצילום ועריכה
-PHOTO_KEYWORDS = [
-    "צלם", "צילום", "photographer", "photography",
-    "צלמת", "צלמים", "צילומי", "פוטוגרף",
-]
-EDIT_KEYWORDS = [
-    "עורך וידאו", "עריכת וידאו", "עריכה", "מונטאז'",
-    "video editor", "video editing", "editor", "post production",
-    "עורכת וידאו", "עורך תוכן",
-]
-REMOTE_KEYWORDS = [
-    "מרחוק", "מהבית", "remote", "online", "פרילנס", "freelance",
-    "עבודה מהבית", "home office",
+PHOTO_KEYWORDS  = ["צלם", "צילום", "photographer", "photography", "צלמת", "פוטוגרף", "צילומי"]
+EDIT_KEYWORDS   = ["עורך וידאו", "עריכת וידאו", "עריכה", "מונטאז'", "video editor", "video editing", "עורכת וידאו"]
+REMOTE_KEYWORDS = ["מרחוק", "מהבית", "remote", "online", "פרילנס", "freelance", "עבודה מהבית"]
+
+DEFAULT_GROUPS = [
+    "https://www.facebook.com/groups/photographersisrael",
+    "https://www.facebook.com/groups/videoeditors.il",
+    "https://www.facebook.com/groups/freelancers.israel",
+    "https://www.facebook.com/groups/cinemaproduction.israel",
+    "https://www.facebook.com/groups/production.israel",
 ]
 
-# קבוצות פייסבוק מומלצות לחיפוש
-FACEBOOK_GROUPS = [
-    {"name": "צלמים ומצולמים ישראל", "url": "https://www.facebook.com/groups/photographersisrael"},
-    {"name": "עורכי וידאו ישראל", "url": "https://www.facebook.com/groups/videoeditors.il"},
-    {"name": "פרילנסרים ישראל", "url": "https://www.facebook.com/groups/freelancers.israel"},
-    {"name": "עבודות צילום ועריכה", "url": "https://www.facebook.com/groups/photojobs.israel"},
-    {"name": "סטודיו והפקות ישראל", "url": "https://www.facebook.com/groups/production.israel"},
-]
+APIFY_ACTOR = "apify/facebook-groups-scraper"
 
 # ─────────────────────────────────────────────
-# פונקציות עזר
+# לוגיקת סינון ותגובות
 # ─────────────────────────────────────────────
 
-def is_relevant_post(text: str) -> tuple[bool, str]:
-    """בדוק אם פוסט רלוונטי ואיזה סוג"""
-    text_lower = text.lower()
-    is_photo = any(kw.lower() in text_lower for kw in PHOTO_KEYWORDS)
-    is_edit = any(kw.lower() in text_lower for kw in EDIT_KEYWORDS)
-    is_remote = any(kw.lower() in text_lower for kw in REMOTE_KEYWORDS)
-
-    if is_photo:
-        return True, "📷 צילום"
-    if is_edit:
-        if is_remote:
-            return True, "🎬 עריכה (ריילנס)"
-        return True, "🎬 עריכה"
-    return False, ""
+def classify_post(text):
+    t = text.lower()
+    if any(k.lower() in t for k in PHOTO_KEYWORDS):
+        return "📷 צילום"
+    if any(k.lower() in t for k in EDIT_KEYWORDS):
+        is_remote = any(k.lower() in t for k in REMOTE_KEYWORDS)
+        return "🎬 עריכה (ריילנס)" if is_remote else "🎬 עריכה"
+    return None
 
 
-def extract_phone(text: str) -> str:
-    """חלץ מספר טלפון מהטקסט"""
-    patterns = [
-        r'0[5-9][0-9]-?[0-9]{7}',
-        r'\+972-?[5-9][0-9]-?[0-9]{7}',
-        r'05[0-9]{8}',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(0)
-    return ""
+def extract_contact(text):
+    phone = re.search(r'0[5-9][0-9]-?\d{7}|\+972-?[5-9][0-9]-?\d{7}', text)
+    if phone:
+        return phone.group(0)
+    email = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+    if email:
+        return email.group(0)
+    return "—"
 
 
-def extract_email(text: str) -> str:
-    """חלץ כתובת מייל מהטקסט"""
-    pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    match = re.search(pattern, text)
-    return match.group(0) if match else ""
-
-
-def generate_reply(post_text: str, job_type: str, poster_name: str) -> str:
-    """צור הצעת תגובה מותאמת אישית"""
-    is_remote = any(kw.lower() in post_text.lower() for kw in REMOTE_KEYWORDS)
-
+def build_reply(job_type, poster):
+    greeting = f"היי {poster}! 👋" if poster and poster != "לא ידוע" else "היי! 👋"
     if "צילום" in job_type:
-        service = "צילום מקצועי"
-        detail = "צלם עם ניסיון רב בצילומי אירועים, מוצרים ותוכן"
+        role = "צלם מקצועי עם ניסיון רב בצילומי אירועים, מוצרים ותוכן דיגיטלי"
     else:
-        service = "עריכת וידאו מקצועית"
-        detail = "עורך וידאו עם ניסיון בריילס, רילז, סרטי קידום ותוכן דיגיטלי"
+        role = "עורך וידאו עם ניסיון בריילס, רילז, סרטי קידום ותוכן דיגיטלי"
+    remote = "\n✅ עובד גם מרחוק – נוח לכל לקוח!" if "ריילנס" in job_type else ""
 
-    remote_line = "\n✅ אני עובד גם מרחוק – נוח לכל לקוח!" if is_remote else ""
-
-    reply = f"""היי {poster_name if poster_name else ''}! 👋
-
-ראיתי את הפוסט שלך ואשמח לעזור 🙂
-אני {MY_INFO['name']} – {detail}.{remote_line}
-
-📞 {MY_INFO['phone']}
-🌐 {MY_INFO['website']}
-📧 {MY_INFO['email']}
-
-מוזמן/ת לפנות ונדבר על הפרויקט!"""
-    return reply.strip()
-
+    return (
+        f"{greeting}\n\n"
+        f"ראיתי את הפוסט ואשמח לעזור 🙂\n"
+        f"אני {MY_INFO['name']} – {role}.{remote}\n\n"
+        f"📞 {MY_INFO['phone']}\n"
+        f"🌐 {MY_INFO['website']}\n"
+        f"📧 {MY_INFO['email']}\n\n"
+        f"מוזמן/ת לפנות ונדבר על הפרויקט!"
+    )
 
 # ─────────────────────────────────────────────
-# Selenium – סריקה אמיתית
+# Apify
 # ─────────────────────────────────────────────
 
-def create_driver(headless: bool = True):
-    """צור דרייבר Chrome"""
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                         "Chrome/120.0.0.0 Safari/537.36")
-    options.add_argument("--lang=he-IL")
-    driver = webdriver.Chrome(options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return driver
+def run_apify_scraper(api_key, group_urls, max_posts):
+    run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/runs?token={api_key}"
+    payload = {
+        "startUrls": [{"url": u} for u in group_urls],
+        "resultsLimit": max_posts,
+        "scrapePostComments": False,
+    }
+
+    with st.spinner("🚀 שולח בקשה ל-Apify..."):
+        resp = requests.post(run_url, json=payload, timeout=30)
+
+    if resp.status_code not in (200, 201):
+        st.error(f"❌ Apify החזיר שגיאה {resp.status_code}: {resp.text[:300]}")
+        return []
+
+    data = resp.json()["data"]
+    run_id = data["id"]
+    dataset_id = data["defaultDatasetId"]
+    st.info(f"✅ Run ID: `{run_id}` – ממתין לסיום...")
+
+    status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={api_key}"
+    bar = st.progress(0, text="סורק קבוצות...")
+    elapsed = 0
+    max_wait = 300
+
+    while elapsed < max_wait:
+        time.sleep(8)
+        elapsed += 8
+        run_status = requests.get(status_url, timeout=15).json()["data"]["status"]
+        pct = min(int(elapsed / max_wait * 100), 95)
+        bar.progress(pct, text=f"סטטוס: {run_status} ({elapsed}s)...")
+
+        if run_status == "SUCCEEDED":
+            bar.progress(100, text="✅ הסריקה הושלמה!")
+            break
+        if run_status in ("FAILED", "ABORTED", "TIMED-OUT"):
+            st.error(f"❌ הסריקה נכשלה: {run_status}")
+            return []
+
+    data_url = (
+        f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+        f"?token={api_key}&format=json&limit=1000"
+    )
+    items = requests.get(data_url, timeout=30).json()
+    return items if isinstance(items, list) else []
 
 
-def facebook_login(driver, email: str, password: str) -> bool:
-    """התחבר לפייסבוק"""
-    try:
-        driver.get("https://www.facebook.com/login")
-        wait = WebDriverWait(driver, 15)
-
-        email_field = wait.until(EC.presence_of_element_located((By.ID, "email")))
-        email_field.clear()
-        email_field.send_keys(email)
-        time.sleep(random.uniform(0.5, 1.2))
-
-        pass_field = driver.find_element(By.ID, "pass")
-        pass_field.clear()
-        pass_field.send_keys(password)
-        time.sleep(random.uniform(0.5, 1.0))
-
-        pass_field.send_keys(Keys.RETURN)
-        time.sleep(random.uniform(4, 6))
-
-        # בדוק אם ההתחברות הצליחה
-        if "login" in driver.current_url or "checkpoint" in driver.current_url:
-            return False
-        return True
-    except Exception as e:
-        st.error(f"שגיאה בהתחברות: {e}")
-        return False
-
-
-def scan_group(driver, group_url: str, max_posts: int = 30) -> list[dict]:
-    """סרוק קבוצה וחזור פוסטים רלוונטיים"""
+def process_items(raw_items):
     results = []
-    try:
-        driver.get(group_url)
-        time.sleep(random.uniform(3, 5))
+    for item in raw_items:
+        text = (
+            item.get("text")
+            or item.get("message")
+            or item.get("postText")
+            or ""
+        )
+        if not text or len(text) < 20:
+            continue
 
-        wait = WebDriverWait(driver, 10)
+        job_type = classify_post(text)
+        if not job_type:
+            continue
 
-        # גלול למטה כדי לטעון עוד פוסטים
-        for _ in range(5):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(random.uniform(2, 3))
+        poster = (
+            item.get("authorName")
+            or item.get("ownerName")
+            or (item.get("user") or {}).get("name", "")
+            or "לא ידוע"
+        )
+        link    = item.get("url") or item.get("postUrl") or item.get("link") or "—"
+        group   = item.get("groupName") or item.get("pageTitle") or "—"
+        contact = extract_contact(text)
+        reply   = build_reply(job_type, poster)
 
-        # מצא פוסטים
-        post_selectors = [
-            '[data-ad-comet-preview="message"]',
-            '[data-ad-preview="message"]',
-            '.userContent',
-            '[role="article"]',
-        ]
-
-        posts_elements = []
-        for selector in post_selectors:
-            posts_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            if posts_elements:
-                break
-
-        for post_el in posts_elements[:max_posts]:
-            try:
-                post_text = post_el.text
-                if len(post_text) < 20:
-                    continue
-
-                relevant, job_type = is_relevant_post(post_text)
-                if not relevant:
-                    continue
-
-                # נסה לקבל שם מפרסם
-                poster_name = ""
-                try:
-                    article = post_el.find_element(By.XPATH, "./ancestor::*[@role='article'][1]")
-                    name_el = article.find_element(By.CSS_SELECTOR, "h2 a, h3 a, strong a")
-                    poster_name = name_el.text
-                except Exception:
-                    pass
-
-                # נסה לקבל קישור לפוסט
-                post_link = ""
-                try:
-                    article = post_el.find_element(By.XPATH, "./ancestor::*[@role='article'][1]")
-                    time_el = article.find_element(By.CSS_SELECTOR, "a[href*='/posts/'], a[href*='?story_fbid=']")
-                    post_link = time_el.get_attribute("href")
-                except Exception:
-                    post_link = group_url
-
-                phone = extract_phone(post_text)
-                email = extract_email(post_text)
-                contact = phone or email or "לא נמצא"
-
-                reply = generate_reply(post_text, job_type, poster_name)
-
-                results.append({
-                    "שם המפרסם": poster_name or "לא ידוע",
-                    "סוג עבודה": job_type,
-                    "פרטי קשר": contact,
-                    "תוכן הפוסט": post_text[:300] + ("..." if len(post_text) > 300 else ""),
-                    "הצעת תגובה": reply,
-                    "קישור לפוסט": post_link,
-                })
-
-            except Exception:
-                continue
-
-    except Exception as e:
-        st.warning(f"⚠️ שגיאה בסריקת {group_url}: {e}")
-
+        results.append({
+            "שם המפרסם":   poster,
+            "סוג עבודה":   job_type,
+            "פרטי קשר":    contact,
+            "קבוצה":       group,
+            "תוכן הפוסט":  text[:350] + ("…" if len(text) > 350 else ""),
+            "הצעת תגובה":  reply,
+            "קישור לפוסט": link,
+        })
     return results
-
 
 # ─────────────────────────────────────────────
 # ממשק Streamlit
@@ -256,265 +202,191 @@ def scan_group(driver, group_url: str, max_posts: int = 30) -> list[dict]:
 
 def main():
     st.set_page_config(
-        page_title="סורק עבודות פייסבוק 📷🎬",
-        page_icon="🔍",
+        page_title="סורק עבודות פייסבוק",
+        page_icon="📷",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
-    # RTL + עיצוב
     st.markdown("""
     <style>
-        body, .stApp { direction: rtl; }
-        .stTextInput input, .stTextArea textarea { direction: rtl; }
-        .stDataFrame { direction: ltr; }
-        h1, h2, h3 { color: #1877F2; }
-        .reply-box {
-            background: #f0f2f5;
-            border-right: 4px solid #1877F2;
-            padding: 12px;
-            border-radius: 8px;
-            font-family: monospace;
-            white-space: pre-wrap;
-            direction: rtl;
-        }
-        .stat-card {
-            background: white;
-            border: 1px solid #ddd;
-            border-radius: 10px;
-            padding: 16px;
-            text-align: center;
-        }
+    @import url('https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Heebo', sans-serif; direction: rtl; }
+    .stButton > button { border-radius: 10px; font-weight: 600; }
+    .reply-card {
+        background: #f8faff;
+        border-right: 4px solid #1877F2;
+        padding: 14px 18px;
+        border-radius: 10px;
+        white-space: pre-wrap;
+        font-size: 0.9rem;
+        line-height: 1.7;
+        direction: rtl;
+        color: #1c1c1c;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("🔍 סורק עבודות צילום ועריכה – פייסבוק")
-    st.caption("מחפש הזדמנויות עבודה בצילום ועריכת וידאו בישראל")
+    st.markdown("## 📷 סורק עבודות צילום ועריכה")
+    st.caption("מבוסס Apify – סריקת פייסבוק בענן, ללא Selenium")
+    st.divider()
 
     # ─── סרגל צד ───
     with st.sidebar:
-        st.header("⚙️ הגדרות")
+        st.header("🔑 Apify")
 
-        st.subheader("🔐 כניסה לפייסבוק")
-        fb_email = st.text_input("אימייל", placeholder="your@email.com")
-        fb_password = st.text_input("סיסמא", type="password")
+        # טען טוקן שמור אם קיים
+        saved_token = load_env_key()
+        token_saved = bool(saved_token)
+
+        apify_key = st.text_input(
+            "API Key",
+            value=saved_token,
+            type="password",
+            help="apify.com → Settings → Integrations → Personal API token",
+        )
+        st.markdown("[📎 קבל API Key חינמי](https://console.apify.com/account/integrations)")
+
+        col_save, col_del = st.columns(2)
+        with col_save:
+            if st.button("💾 שמור טוקן", use_container_width=True, disabled=not apify_key):
+                save_env_key(apify_key)
+                st.success("✅ נשמר!")
+        with col_del:
+            if st.button("🗑️ מחק טוקן", use_container_width=True, disabled=not token_saved):
+                delete_env_key()
+                st.warning("טוקן נמחק")
+                st.rerun()
+
+        if token_saved:
+            st.caption("🟢 טוקן שמור נטען אוטומטית")
 
         st.divider()
-        st.subheader("👤 הפרטים שלי (לתגובות)")
-        my_name = st.text_input("שם", value=MY_INFO["name"])
-        my_phone = st.text_input("טלפון", value=MY_INFO["phone"])
-        my_website = st.text_input("אתר", value=MY_INFO["website"])
-        my_email_display = st.text_input("מייל", value=MY_INFO["email"])
+        st.header("👤 הפרטים שלי")
+        MY_INFO["name"]    = st.text_input("שם",    value=MY_INFO["name"])
+        MY_INFO["phone"]   = st.text_input("טלפון", value=MY_INFO["phone"])
+        MY_INFO["website"] = st.text_input("אתר",   value=MY_INFO["website"])
+        MY_INFO["email"]   = st.text_input("מייל",  value=MY_INFO["email"])
 
         st.divider()
-        st.subheader("🔧 הגדרות סריקה")
+        st.header("⚙️ סריקה")
         max_posts = st.slider("פוסטים מקסימום לקבוצה", 10, 100, 30)
-        headless_mode = st.checkbox("מצב שקט (ללא חלון)", value=True)
 
-        st.divider()
-        st.subheader("📋 קבוצות לסריקה")
-        group_names = [g["name"] for g in FACEBOOK_GROUPS]
-        selected_groups = st.multiselect(
-            "בחר קבוצות",
-            options=group_names,
-            default=group_names[:3]
+        st.header("📋 קבוצות")
+        groups_text = st.text_area(
+            "קישורים (שורה לכל קישור)",
+            value="\n".join(DEFAULT_GROUPS),
+            height=180,
         )
 
-        custom_group = st.text_input("➕ קישור קבוצה נוספת (אופציונלי)")
+    # ─── טאבים ───
+    tab_scan, tab_results, tab_help = st.tabs(["🚀 סריקה", "📊 תוצאות", "ℹ️ עזרה"])
 
-    # ─── ראשי ───
-    tab1, tab2, tab3 = st.tabs(["🚀 סריקה חדשה", "📊 תוצאות", "ℹ️ הוראות"])
+    # ══ סריקה ══
+    with tab_scan:
+        group_urls = [u.strip() for u in groups_text.splitlines() if u.strip().startswith("http")]
 
-    with tab1:
-        st.subheader("הפעל סריקה")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("קבוצות", len(group_urls))
+        c2.metric("פוסטים מקסימום", max_posts * len(group_urls))
+        c3.metric("סוג עבודה", "צילום + עריכה")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("קבוצות שנבחרו", len(selected_groups))
-        col2.metric("פוסטים מקסימום", max_posts * len(selected_groups))
-        col3.metric("סוגי עבודה", "צילום + עריכה")
-
-        st.info("💡 הסריקה מחפשת אוטומטית מודעות צילום ועריכה ומכינה עבורך תגובות מוכנות לשליחה")
+        st.info("האפליקציה תסרוק את הקבוצות דרך Apify, תסנן מודעות רלוונטיות ותכין תגובות מוכנות.")
 
         if st.button("▶️ התחל סריקה", type="primary", use_container_width=True):
-            if not fb_email or not fb_password:
-                st.error("❌ יש להזין אימייל וסיסמא לפייסבוק")
+            if not apify_key:
+                st.error("❌ יש להזין Apify API Key בסרגל הצד")
+                st.stop()
+            if not group_urls:
+                st.error("❌ יש להוסיף לפחות קישור קבוצה אחד")
                 st.stop()
 
-            if not selected_groups:
-                st.error("❌ יש לבחור לפחות קבוצה אחת")
-                st.stop()
+            raw     = run_apify_scraper(apify_key, group_urls, max_posts)
+            results = process_items(raw) if raw else []
 
-            # עדכן MY_INFO עם הפרטים מהצד
-            MY_INFO.update({
-                "name": my_name,
-                "phone": my_phone,
-                "website": my_website,
-                "email": my_email_display,
-            })
+            if results:
+                st.session_state["results"]   = results
+                st.session_state["scan_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                st.success(f"🎉 נמצאו **{len(results)}** מודעות רלוונטיות!")
+                st.balloons()
+            else:
+                st.warning("לא נמצאו מודעות רלוונטיות. נסה קבוצות אחרות או בדוק את ה-API Key.")
 
-            all_results = []
-            progress = st.progress(0, text="מתחיל...")
-            status = st.empty()
-
-            groups_to_scan = [g for g in FACEBOOK_GROUPS if g["name"] in selected_groups]
-            if custom_group and custom_group.startswith("http"):
-                groups_to_scan.append({"name": "קבוצה מותאמת", "url": custom_group})
-
-            try:
-                status.info("🌐 פותח דפדפן...")
-                driver = create_driver(headless=headless_mode)
-
-                status.info("🔐 מתחבר לפייסבוק...")
-                logged_in = facebook_login(driver, fb_email, fb_password)
-
-                if not logged_in:
-                    st.error("❌ הכניסה לפייסבוק נכשלה. בדוק את הפרטים ונסה שוב.")
-                    driver.quit()
-                    st.stop()
-
-                st.success("✅ התחברת בהצלחה לפייסבוק!")
-
-                for i, group in enumerate(groups_to_scan):
-                    pct = int((i / len(groups_to_scan)) * 100)
-                    progress.progress(pct, text=f"סורק: {group['name']}...")
-                    status.info(f"🔍 סורק קבוצה: {group['name']}")
-
-                    results = scan_group(driver, group["url"], max_posts)
-                    for r in results:
-                        r["קבוצה"] = group["name"]
-                    all_results.extend(results)
-
-                    time.sleep(random.uniform(2, 4))
-
-                driver.quit()
-                progress.progress(100, text="✅ הסריקה הושלמה!")
-                status.success(f"🎉 נמצאו {len(all_results)} מודעות רלוונטיות!")
-
-                if all_results:
-                    st.session_state["results"] = all_results
-                    st.session_state["scan_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                    st.balloons()
-                else:
-                    st.warning("לא נמצאו מודעות רלוונטיות בסריקה זו. נסה קבוצות אחרות.")
-
-            except Exception as e:
-                st.error(f"❌ שגיאה בסריקה: {e}")
-                st.info("💡 ודא ש-ChromeDriver מותקן: pip install selenium webdriver-manager")
-
-    with tab2:
-        st.subheader("📊 תוצאות הסריקה")
-
-        if "results" not in st.session_state or not st.session_state["results"]:
-            st.info("🔍 עדיין לא הרצת סריקה. לך ל'סריקה חדשה' והתחל.")
+    # ══ תוצאות ══
+    with tab_results:
+        if not st.session_state.get("results"):
+            st.info("עדיין אין תוצאות – הרץ סריקה בטאב הראשון.")
         else:
             results = st.session_state["results"]
-            scan_time = st.session_state.get("scan_time", "")
+            st.caption(f"⏱️ {st.session_state.get('scan_time','')} | {len(results)} מודעות")
 
-            st.caption(f"⏱️ נסרק בתאריך: {scan_time} | סה\"כ {len(results)} מודעות")
+            f1, f2 = st.columns(2)
+            with f1:
+                ftype = st.selectbox("סנן לפי סוג", ["הכל","📷 צילום","🎬 עריכה","🎬 עריכה (ריילנס)"])
+            with f2:
+                fcontact = st.checkbox("רק עם פרטי קשר")
 
-            # סינון
-            col1, col2 = st.columns(2)
-            with col1:
-                filter_type = st.selectbox("סנן לפי סוג", ["הכל", "📷 צילום", "🎬 עריכה", "🎬 עריכה (ריילנס)"])
-            with col2:
-                filter_contact = st.checkbox("רק עם פרטי קשר")
+            shown = [r for r in results if ftype == "הכל" or ftype in r["סוג עבודה"]]
+            if fcontact:
+                shown = [r for r in shown if r["פרטי קשר"] != "—"]
 
-            filtered = results
-            if filter_type != "הכל":
-                filtered = [r for r in filtered if filter_type in r["סוג עבודה"]]
-            if filter_contact:
-                filtered = [r for r in filtered if r["פרטי קשר"] != "לא נמצא"]
-
-            # טבלה ראשית
-            df = pd.DataFrame(filtered)
-            display_cols = ["שם המפרסם", "סוג עבודה", "פרטי קשר", "קבוצה", "תוכן הפוסט"]
-            available_cols = [c for c in display_cols if c in df.columns]
-
+            df = pd.DataFrame(shown)
+            table_cols = ["שם המפרסם","סוג עבודה","פרטי קשר","קבוצה","תוכן הפוסט"]
             st.dataframe(
-                df[available_cols],
-                use_container_width=True,
-                height=400,
-                column_config={
-                    "תוכן הפוסט": st.column_config.TextColumn(width="large"),
-                    "קישור לפוסט": st.column_config.LinkColumn(),
-                }
+                df[[c for c in table_cols if c in df.columns]],
+                use_container_width=True, height=380,
+                column_config={"תוכן הפוסט": st.column_config.TextColumn(width="large")},
             )
 
-            # כרטיסי תגובה
             st.divider()
-            st.subheader("💬 הצעות תגובה מוכנות")
-
-            for i, row in enumerate(filtered):
-                with st.expander(f"#{i+1} | {row['שם המפרסם']} | {row['סוג עבודה']}"):
-                    col1, col2 = st.columns([2, 1])
-                    with col1:
-                        st.markdown("**📝 הצעת תגובה:**")
-                        st.markdown(f'<div class="reply-box">{row["הצעת תגובה"]}</div>',
+            st.subheader("💬 תגובות מוכנות לשליחה")
+            for i, row in enumerate(shown):
+                with st.expander(f"#{i+1}  |  {row['שם המפרסם']}  |  {row['סוג עבודה']}"):
+                    left, right = st.columns([3, 1])
+                    with left:
+                        st.markdown(f'<div class="reply-card">{row["הצעת תגובה"]}</div>',
                                     unsafe_allow_html=True)
-                        if st.button(f"📋 העתק תגובה #{i+1}", key=f"copy_{i}"):
-                            st.code(row["הצעת תגובה"])
-                    with col2:
-                        st.markdown("**🔗 קישור לפוסט:**")
-                        if row.get("קישור לפוסט"):
-                            st.markdown(f"[פתח פוסט בפייסבוק]({row['קישור לפוסט']})")
-                        st.markdown(f"**📞 קשר:** {row['פרטי קשר']}")
+                        if st.button("📋 הצג להעתקה", key=f"btn_{i}"):
+                            st.code(row["הצעת תגובה"], language=None)
+                    with right:
+                        st.markdown(f"**📞** {row['פרטי קשר']}")
+                        if row["קישור לפוסט"] != "—":
+                            st.markdown(f"[🔗 פתח פוסט]({row['קישור לפוסט']})")
 
-            # ייצוא
             st.divider()
-            col1, col2 = st.columns(2)
-            with col1:
+            e1, e2 = st.columns(2)
+            with e1:
                 csv = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                st.download_button(
-                    "⬇️ הורד כ-CSV",
-                    data=csv,
+                st.download_button("⬇️ CSV", csv,
                     file_name=f"jobs_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            with col2:
-                json_data = json.dumps(filtered, ensure_ascii=False, indent=2).encode("utf-8")
-                st.download_button(
-                    "⬇️ הורד כ-JSON",
-                    data=json_data,
+                    mime="text/csv", use_container_width=True)
+            with e2:
+                js = json.dumps(shown, ensure_ascii=False, indent=2).encode("utf-8")
+                st.download_button("⬇️ JSON", js,
                     file_name=f"jobs_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
+                    mime="application/json", use_container_width=True)
 
-    with tab3:
-        st.subheader("ℹ️ הוראות התקנה והפעלה")
+    # ══ עזרה ══
+    with tab_help:
+        st.subheader("🛠️ התקנה")
+        st.code("pip install streamlit requests pandas\nstreamlit run facebook_job_scanner.py",
+                language="bash")
+
+        st.subheader("🔑 איך לקבל Apify API Key")
         st.markdown("""
-        ### 🛠️ התקנה
+1. הירשם בחינם בـ [apify.com](https://apify.com)
+2. לך לـ **Settings → Integrations**
+3. העתק את **Personal API token**
+4. הדבק בשדה API Key בסרגל הצד
 
-        **1. התקן Python ו-pip**
+> התוכנית החינמית נותנת **$5 קרדיט/חודש** – מספיק לעשרות סריקות.
+        """)
 
-        **2. התקן תלויות:**
-        ```bash
-        pip install streamlit selenium pandas webdriver-manager
-        ```
-
-        **3. התקן ChromeDriver:**
-        ```bash
-        pip install webdriver-manager
-        ```
-        אם ChromeDriver לא מותקן אוטומטית, הורד ידנית מ: https://chromedriver.chromium.org
-
-        ### 🚀 הרצה
-
-        ```bash
-        streamlit run facebook_job_scanner.py
-        ```
-
-        ### 💡 טיפים
-        - **ביקורת ידנית**: תמיד עיין בתגובה לפני שליחה
-        - **זמן בין סריקות**: מומלץ לחכות שעה בין סריקות
-        - **קבוצות**: הוסף קבוצות ספציפיות לתחום שלך
-        - **פרטי קשר**: ודא שהפרטים שלך מעודכנים בסרגל הצד
-
-        ### ⚠️ הגבלות
-        - פייסבוק עשוי לדרוש אימות נוסף בגישה ממקום חדש
-        - מומלץ לא לבצע יותר מ-5 סריקות ביום
-        - אם מוצגת בקשת 2FA, היה נוכח בסריקה הראשונה
+        st.subheader("⚠️ טיפים")
+        st.markdown("""
+- **קבוצות פרטיות**: Apify סורק רק קבוצות שהפרופיל שלך חבר בהן
+- **עדכון יומי**: מומלץ להריץ פעם בבוקר
+- **זמן סריקה**: 2–4 דקות לריצה רגילה
         """)
 
 
