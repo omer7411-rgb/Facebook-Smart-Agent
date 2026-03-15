@@ -63,7 +63,8 @@ DEFAULT_GROUPS = [
     "https://www.facebook.com/groups/production.israel",
 ]
 
-APIFY_ACTOR = "apify/facebook-groups-scraper"
+# Actor הרשמי של Apify לסריקת פוסטים מקבוצות
+APIFY_ACTOR = "apify/facebook-posts-scraper"
 
 # ─────────────────────────────────────────────
 # לוגיקת סינון ותגובות
