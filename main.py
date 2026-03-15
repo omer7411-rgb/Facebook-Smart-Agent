@@ -63,8 +63,7 @@ DEFAULT_GROUPS = [
     "https://www.facebook.com/groups/production.israel",
 ]
 
-# Actor הרשמי של Apify לסריקת פוסטים מקבוצות
-APIFY_ACTOR = "apify/facebook-posts-scraper"
+APIFY_ACTOR = "apify/facebook-groups-scraper"
 
 # ─────────────────────────────────────────────
 # לוגיקת סינון ותגובות
@@ -116,8 +115,9 @@ def run_apify_scraper(api_key, group_urls, max_posts):
     run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/runs?token={api_key}"
     payload = {
         "startUrls": [{"url": u} for u in group_urls],
-        "resultsLimit": max_posts,
-        "scrapePostComments": False,
+        "maxPosts": max_posts,
+        "includeComments": False,
+        "maxComments": 0,
     }
 
     with st.spinner("🚀 שולח בקשה ל-Apify..."):
